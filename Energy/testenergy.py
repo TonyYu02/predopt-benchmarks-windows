@@ -54,12 +54,13 @@ from Trainer.comb_solver import data_reading
 from distutils.util import strtobool
 import json 
 import os
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 parser = argparse.ArgumentParser(description="Testing framework for Decision-Focused Learning on energy optimization problems")
 
 # Problem configuration
 parser.add_argument("--instance", type=int, help="Instance type to solve (1, 2, or 3)", default=1, required=False)
-parser.add_argument("--model", type=str, help="Name of the DFL model to evaluate (e.g., 'SPO', 'DBB', 'DPO')", default="", required=False)
+parser.add_argument("--model", type=str, help="Name of the DFL model to evaluate (e.g., 'SPO', 'DBB', 'DPO')", default="DPO", required=False)
 parser.add_argument("--loss", type=str, help="Loss function for training", default="", required=False)
 
 # Training parameters
@@ -86,7 +87,7 @@ parser.add_argument("--diffKKT", action='store_true', help="Whether KKT or HSD",
 parser.add_argument("--tau", type=float, help="Parameter of rankwise losses", default=1e-8, required=False)
 parser.add_argument("--growth", type=float, help="Growth parameter of rankwise losses", default=0.05, required=False)
 
-parser.add_argument('--scheduler', dest='scheduler', type=lambda x: bool(strtobool(x)), required=False)
+parser.add_argument('--scheduler', dest='scheduler', type=lambda x: bool(strtobool(x)), default=True, required=False)
 
 
 class _Sentinel:
@@ -106,162 +107,162 @@ def seed_all(seed):
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
+def main():
 # Load parameter sets from JSON file
-with open('config.json', "r") as json_file:
-    parameter_sets = json.load(json_file)
+    with open('config.json', "r") as json_file:
+        parameter_sets = json.load(json_file)
 
-for parameters in parameter_sets:
-    # Parse arguments from config file
-    Args = argparse.Namespace(**parameters)
-    args = parser.parse_args(namespace=Args)
-    argument_dict = vars(args)
+    for parameters in parameter_sets:
+        # Parse arguments from config file
+        Args = argparse.Namespace(**parameters)
+        args = parser.parse_args(namespace=Args)
+        argument_dict = vars(args)
 
-    # Extract explicit arguments for logging
-    explicit_keys = {key: sentinel if key not in parameters else parameters[key] for key in argument_dict}
-    sentinel_ns = Namespace(**explicit_keys)
-    parser.parse_args(namespace=sentinel_ns)
-    explicit = {key: value for key, value in vars(sentinel_ns).items() if value is not sentinel}
+        # Extract explicit arguments for logging
+        explicit_keys = {key: sentinel if key not in parameters else parameters[key] for key in argument_dict}
+        sentinel_ns = Namespace(**explicit_keys)
+        parser.parse_args(namespace=sentinel_ns)
+        explicit = {key: value for key, value in vars(sentinel_ns).items() if value is not sentinel}
 
 
-    load = args.instance
-    argument_dict = vars(args)
-    get_class = lambda x: globals()[x]
-    modelcls = get_class(argument_dict['model'])
-    modelname = argument_dict.pop('model')
+        load = args.instance
+        argument_dict = vars(args)
+        get_class = lambda x: globals()[x]
+        modelcls = get_class(argument_dict['model'])
+        modelname = argument_dict.pop('model')
 
-    # Configure experiment directories and files
-    log_dir = f"lightning_logs/{modelname}_{argument_dict['loss']}/"
-    outputfile = f"results/{modelname}_{argument_dict['loss']}.csv"
-    regretfile = f"regret/{modelname}_{argument_dict['loss']}.csv"
-    ckpt_dir = "checkpoints/"
-    learning_curve_datafile = f"learning_curves/{modelname}_{argument_dict['loss']}.csv"
+        # Configure experiment directories and files
+        log_dir = f"lightning_logs/{modelname}_{argument_dict['loss']}/"
+        outputfile = f"results/{modelname}_{argument_dict['loss']}.csv"
+        regretfile = f"regret/{modelname}_{argument_dict['loss']}.csv"
+        ckpt_dir = "checkpoints/"
+        learning_curve_datafile = f"learning_curves/{modelname}_{argument_dict['loss']}.csv"
 
-    # Create necessary directories
-    os.makedirs("results", exist_ok=True)
-    os.makedirs("regret", exist_ok=True)
-    os.makedirs("learning_curves", exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
+        # Create necessary directories
+        os.makedirs("results", exist_ok=True)
+        os.makedirs("regret", exist_ok=True)
+        os.makedirs("learning_curves", exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Configure model checkpointing and logging
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=ckpt_dir,
-        filename='{epoch}-{val_regret:.2f}',
-        save_top_k=1,
-        verbose=True,
-        monitor='val_regret',
-        mode='min'
-    )
-    tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_dir)
-
-    # Load energy data for the specified instance
-    instance = argument_dict.pop('instance')
-    data = data_reading(instance)
-    data = EnergyDataModule(data, batch_size=argument_dict['batch_size'])
-    data.setup()
-    param = data_reading("SchedulingInstances/load{}/day01.txt".format(load))
-
-    # Clean existing logs for fresh run
-    shutil.rmtree(log_dir, ignore_errors=True)
-
-    # Repeat experiments over 10 random seeds for statistical validation
-    for seed in range(10):
-        seed_all(seed)
-        shutil.rmtree(ckpt_dir, ignore_errors=True)
+        # Configure model checkpointing and logging
         checkpoint_callback = ModelCheckpoint(
-                #monitor="val_regret",mode="min",
-                dirpath=ckpt_dir, 
-                filename="model-{epoch:02d}-{val_regret:.8f}",
-                )
-
-        g = torch.Generator()
-        g.manual_seed(seed)    
-        data =  EnergyDataModule(param =  data, batch_size= argument_dict['batch_size'], generator=g, seed= seed)
-
-        if modelname=="CachingPO":
-            cache = torch.from_numpy (data.train_df.sol)
-        tb_logger = pl_loggers.TensorBoardLogger(save_dir= log_dir, version=seed)
-        trainer = pl.Trainer(max_epochs= argument_dict['max_epochs'], 
-        min_epochs=1,logger=tb_logger, callbacks=[checkpoint_callback])
-        if modelname=="CachingPO":
-            model =  modelcls(param =  data,  init_cache=cache,seed=seed, **argument_dict)
-        else:
-            model =  modelcls(param =  data,   seed=seed, **argument_dict)
-
-        # Model Training and Evaluation
-        # Initialize model with appropriate parameters
-        trainer = pl.Trainer(
-            max_epochs=argument_dict['max_epochs'],
-            min_epochs=1,
-            logger=tb_logger,
-            callbacks=[checkpoint_callback]
+            dirpath=ckpt_dir,
+            filename='{epoch}-{val_regret:.2f}',
+            save_top_k=1,
+            verbose=True,
+            monitor='val_regret',
+            mode='min'
         )
+        tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_dir)
 
-        # Handle special case for CachingPO model
-        if modelname == "CachingPO":
-            model = modelcls(param=data, init_cache=cache, seed=seed, **argument_dict)
-        else:
-            model =  modelcls(param =  param,   seed=seed, **argument_dict)
-        validresult = trainer.validate(model,datamodule=data)
-        
-        # Train the model
-        trainer.fit(model, datamodule=data)
-        best_model_path = checkpoint_callback.best_model_path
+        # Load energy data for the specified instance
+        instance = argument_dict.pop('instance')
+        raw_data_source = data_reading("SchedulingInstances/load{}/day01.txt".format(load))
+        data = EnergyDataModule(raw_data_source, batch_size=argument_dict['batch_size'])
+        data.setup()
+        param = data_reading("SchedulingInstances/load{}/day01.txt".format(load))
 
-        if modelname=="CachingPO":
-            model =  modelcls.load_from_checkpoint(best_model_path,
-            param =  param,  init_cache=cache,seed=seed, **argument_dict)
-        else:
-            model =  modelcls.load_from_checkpoint(best_model_path,
-            param =  param,   seed=seed, **argument_dict)
-        ##### SummaryWrite ######################
-        validresult = trainer.validate(model,datamodule=data)
-        testresult = trainer.test(model, datamodule=data)
-        df = pd.DataFrame({**testresult[0], **validresult[0]},index=[0])
-        for k,v in explicit.items():
-            df[k] = v
-        df['seed'] = seed
-        df['instance'] = load
-        with open(outputfile, 'a') as f:
+        # Clean existing logs for fresh run
+        shutil.rmtree(log_dir, ignore_errors=True)
+
+        # Repeat experiments over 10 random seeds for statistical validation
+        for seed in range(10):
+            seed_all(seed)
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+            checkpoint_callback = ModelCheckpoint(
+                    #monitor="val_regret",mode="min",
+                    dirpath=ckpt_dir,
+                    filename="model-{epoch:02d}-{val_regret:.8f}",
+                    )
+
+            g = torch.Generator()
+            g.manual_seed(seed)
+            data = EnergyDataModule(
+                param=raw_data_source,
+                batch_size=argument_dict['batch_size'],
+                generator=g,
+                seed=seed
+            )
+
+            data.setup()
+
+            if modelname=="CachingPO":
+                cache = torch.from_numpy (data.train_df.sol)
+            tb_logger = pl_loggers.TensorBoardLogger(save_dir= log_dir, version=seed)
+
+            # Model Training and Evaluation
+            # Initialize model with appropriate parameters
+            trainer = pl.Trainer(
+                max_epochs=argument_dict['max_epochs'],
+                min_epochs=1,
+                logger=tb_logger,
+                callbacks=[checkpoint_callback]
+            )
+
+            # Handle special case for CachingPO model
+            if modelname == "CachingPO":
+                model = modelcls(param=data, init_cache=cache, seed=seed, **argument_dict)
+            else:
+                model =  modelcls(param =  param,   seed=seed, **argument_dict)
+            validresult = trainer.validate(model,datamodule=data)
+
+            # Train the model
+            trainer.fit(model, datamodule=data)
+            best_model_path = checkpoint_callback.best_model_path
+
+            if modelname=="CachingPO":
+                model =  modelcls.load_from_checkpoint(best_model_path,
+                param =  param,  init_cache=cache,seed=seed, **argument_dict)
+            else:
+                model =  modelcls.load_from_checkpoint(best_model_path,
+                param =  param,   seed=seed, **argument_dict)
+            ##### SummaryWrite ######################
+            validresult = trainer.validate(model,datamodule=data)
+            testresult = trainer.test(model, datamodule=data)
+            df = pd.DataFrame({**testresult[0], **validresult[0]},index=[0])
+            for k,v in explicit.items():
+                df[k] = v
+            df['seed'] = seed
+            df['instance'] = load
+            with open(outputfile, 'a') as f:
+                    df.to_csv(f, header=f.tell()==0)
+
+            regret_list = trainer.predict(model, data.test_dataloader())
+
+            df = pd.DataFrame({"regret":regret_list[0].tolist()})
+            df.index.name='instance'
+            for k,v in explicit.items():
+                df[k] = v
+            df['seed'] = seed
+            df['instance'] = load
+            with open(regretfile, 'a') as f:
                 df.to_csv(f, header=f.tell()==0)
 
 
-        regret_list = trainer.predict(model, data.test_dataloader())
-        
 
-        df = pd.DataFrame({"regret":regret_list[0].tolist()})
-        df.index.name='instance'
-        for k,v in explicit.items():
-            df[k] = v
-        df['seed'] = seed
-        df['instance'] = load    
-        with open(regretfile, 'a') as f:
-            df.to_csv(f, header=f.tell()==0)
+        ###############################  Save  Learning Curve Data ########
+        parent_dir=   log_dir+"lightning_logs/"
+        version_dirs = [os.path.join(parent_dir,v) for v in os.listdir(parent_dir)]
 
+        walltimes = []
+        steps = []
+        regrets= []
+        mses = []
+        for logs in version_dirs:
+            event_accumulator = EventAccumulator(logs)
+            event_accumulator.Reload()
 
+            events = event_accumulator.Scalars("val_regret")
+            walltimes.extend( [x.wall_time for x in events])
+            steps.extend([x.step for x in events])
+            regrets.extend([x.value for x in events])
+            events = event_accumulator.Scalars("val_mse")
+            mses.extend([x.value for x in events])
 
-    ###############################  Save  Learning Curve Data ########
-    import os
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-    parent_dir=   log_dir+"lightning_logs/"
-    version_dirs = [os.path.join(parent_dir,v) for v in os.listdir(parent_dir)]
+        df = pd.DataFrame({"step": steps,'wall_time':walltimes,  "val_regret": regrets,
+        "val_mse": mses })
+        df['model'] = modelname
+        df.to_csv(learning_curve_datafile)
 
-    walltimes = []
-    steps = []
-    regrets= []
-    mses = []
-    for logs in version_dirs:
-        event_accumulator = EventAccumulator(logs)
-        event_accumulator.Reload()
-
-        events = event_accumulator.Scalars("val_regret")
-        walltimes.extend( [x.wall_time for x in events])
-        steps.extend([x.step for x in events])
-        regrets.extend([x.value for x in events])
-        events = event_accumulator.Scalars("val_mse")
-        mses.extend([x.value for x in events])
-
-    df = pd.DataFrame({"step": steps,'wall_time':walltimes,  "val_regret": regrets,
-    "val_mse": mses })
-    df['model'] = modelname
-    df.to_csv(learning_curve_datafile)
+if __name__ == "__main__":
+    main()
